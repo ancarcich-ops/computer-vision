@@ -34,6 +34,7 @@ cv/
     ├── detect_logos.py  # main pipeline (orb / sift / yolo backends)
     ├── build_dataset.py # combine many clips + negatives into one YOLO dataset
     ├── harvest_real.py  # SIFT teacher auto-labels real frames (one clip)
+    ├── extract_frames.py # dump frames for manual labeling (see LABELING.md)
     ├── gen_synthetic.py # build a YOLO dataset from one logo crop
     ├── train_yolo.py    # train YOLOv8 on the dataset
     └── make_demo.py     # synthetic demo generator (verification)
