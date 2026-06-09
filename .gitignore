@@ -1,0 +1,3 @@
+# Ultralytics writes training runs here (runs_dir) at repo root — never commit
+runs/
+*.pt

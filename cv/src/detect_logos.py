@@ -197,15 +197,41 @@ def write_exposure_report(
 
 
 def process_video(args: argparse.Namespace) -> None:
-    detector = build_detector(args.detector)
-    matcher = build_matcher(args.detector)
+    # Build a detector-agnostic `detect_fn(frame_bgr) -> sv.Detections` so the
+    # tracking + exposure code below is shared by feature matching and YOLO.
+    if args.detector == "yolo":
+        from ultralytics import YOLO  # heavy import; only needed for this path
+        print(f"Loading YOLO weights from {args.weights} ...")
+        model = YOLO(args.weights)
+        names = [model.names[i] for i in sorted(model.names)]
 
-    logo_dir = Path(args.logos)
-    print(f"Loading logos from {logo_dir}/ using {args.detector.upper()} ...")
-    templates = load_logos(logo_dir, detector, args.detector)
-    if not templates:
-        raise SystemExit("No usable logo templates found. Add images to the logos folder.")
-    names = [t.name for t in templates]
+        def detect_fn(frame: np.ndarray) -> sv.Detections:
+            res = model.predict(frame, conf=args.conf, iou=0.5,
+                                verbose=False, device="cpu")[0]
+            return sv.Detections.from_ultralytics(res)
+    else:
+        detector = build_detector(args.detector)
+        matcher = build_matcher(args.detector)
+        logo_dir = Path(args.logos)
+        print(f"Loading logos from {logo_dir}/ using {args.detector.upper()} ...")
+        templates = load_logos(logo_dir, detector, args.detector)
+        if not templates:
+            raise SystemExit("No usable logo templates found. Add images to the logos folder.")
+        names = [t.name for t in templates]
+
+        def detect_fn(frame: np.ndarray) -> sv.Detections:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Detect on a downscaled copy for speed, then map boxes back up.
+            if args.scale != 1.0:
+                small = cv2.resize(gray, None, fx=args.scale, fy=args.scale,
+                                   interpolation=cv2.INTER_AREA)
+                det = detect_in_frame(small, templates, detector, matcher,
+                                      args.min_good, args.min_inliers)
+                if len(det):
+                    det.xyxy = det.xyxy / args.scale
+                return det
+            return detect_in_frame(gray, templates, detector, matcher,
+                                   args.min_good, args.min_inliers)
 
     box_annotator = sv.BoxAnnotator()
     label_annotator = sv.LabelAnnotator()
@@ -246,18 +272,7 @@ def process_video(args: argparse.Namespace) -> None:
             if args.max_frames and processed >= args.max_frames:
                 break
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # Detect on a downscaled copy for speed, then map boxes back up.
-            if args.scale != 1.0:
-                small = cv2.resize(gray, None, fx=args.scale, fy=args.scale,
-                                   interpolation=cv2.INTER_AREA)
-                detections = detect_in_frame(small, templates, detector, matcher,
-                                             args.min_good, args.min_inliers)
-                if len(detections):
-                    detections.xyxy = detections.xyxy / args.scale
-            else:
-                detections = detect_in_frame(gray, templates, detector, matcher,
-                                             args.min_good, args.min_inliers)
+            detections = detect_fn(frame)
 
             if tracker is not None:
                 detections = tracker.update_with_detections(detections)
@@ -317,9 +332,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", default="output/annotated.mp4", help="output video path")
     p.add_argument("--report", default="output/exposure.csv",
                    help="per-logo exposure CSV output path")
-    p.add_argument("--detector", choices=["orb", "sift"], default="orb",
-                   help="feature detector (orb=fast; sift=robust, best for "
-                        "text/wordmark logos)")
+    p.add_argument("--detector", choices=["orb", "sift", "yolo"], default="orb",
+                   help="orb=fast feature match; sift=robust feature match "
+                        "(best for wordmarks); yolo=trained detector (best recall)")
+    p.add_argument("--weights", default="runs/logo_yolo/weights/best.pt",
+                   help="YOLO weights path (used when --detector yolo)")
+    p.add_argument("--conf", type=float, default=0.25,
+                   help="YOLO confidence threshold (used when --detector yolo)")
     p.add_argument("--stride", type=int, default=1, help="process every Nth frame")
     p.add_argument("--max-frames", type=int, default=0, help="cap frames processed (0=all)")
     p.add_argument("--scale", type=float, default=1.0,

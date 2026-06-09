@@ -4,9 +4,16 @@ Detect **specific known logos** (sponsor brands) in soccer-game video and write
 an annotated video with bounding boxes + labels. Intended for sponsor-exposure /
 brand-visibility analytics.
 
-Detection is **reference-based feature matching** (OpenCV ORB/SIFT + homography)
-— no training, no GPU. You supply one cropped reference image per logo;
-`supervision` handles annotation and video I/O.
+Two detection backends share one tracking + exposure pipeline:
+
+1. **Reference feature matching** (OpenCV ORB/SIFT + homography) — no training,
+   no GPU, just one cropped reference image per logo. High precision, partial
+   recall.
+2. **Trained YOLOv8 detector** (`--detector yolo`) — best recall, generalises to
+   scale/rotation/occlusion. Trained here from a *single* logo crop via synthetic
+   data, so it still needs no hand-labelling. See **[YOLO route](#yolo-route-best-recall)**.
+
+`supervision` handles ByteTrack tracking, annotation, and video I/O.
 
 See [`HANDOFF.md`](HANDOFF.md) for full context: decisions, environment notes,
 verification results, and the roadmap.
@@ -21,8 +28,12 @@ cv/
 ├── logos/               # reference logo crops (input; filename = label)
 ├── videos/              # input video clips
 ├── output/              # annotated results (generated)
+├── dataset/            # synthetic YOLO dataset (generated)
+├── runs/               # YOLO training outputs / weights (generated)
 └── src/
-    ├── detect_logos.py  # main pipeline
+    ├── detect_logos.py  # main pipeline (orb / sift / yolo backends)
+    ├── gen_synthetic.py # build a YOLO dataset from one logo crop
+    ├── train_yolo.py    # train YOLOv8 on the synthetic dataset
     └── make_demo.py     # synthetic demo generator (verification)
 ```
 
@@ -93,6 +104,37 @@ Disable tracking with `--no-track` (then tracked == detected).
 Feature matching is **high-precision, partial-recall** on small/deformable
 logos: it catches clear, head-on instances and misses angled/occluded/tiny ones,
 so exposure numbers *undercount*. ByteTrack mitigates this but can't invent
-detections across long gaps. If recall matters, the upgrade path is a trained
-YOLO logo detector (`detect_in_frame` is the only piece that swaps out — the
-tracking + exposure code is reused). See `HANDOFF.md` §4 and §8.
+detections across long gaps. The fix is the trained YOLO backend below.
+
+## YOLO route (best recall)
+
+A trained detector generalises to scale, rotation, and partial occlusion far
+better than feature matching — but normally needs a hand-labelled dataset we
+don't have. We bootstrap one from the **single logo crop**: paste it onto real
+clip frames under random augmentation and auto-generate YOLO labels.
+
+```bash
+# 1. Synthesize a labelled dataset from one crop + the clip (backgrounds)
+python src/gen_synthetic.py --video videos/match.mp4 --logo logos/lenovo.png \
+    --out dataset --train 240 --val 50
+
+# 2. Fine-tune YOLOv8n on CPU (base weights auto-download once)
+python src/train_yolo.py --data dataset/data.yaml --epochs 30 --imgsz 416
+
+# 3. Detect with the trained model — same tracking + exposure CSV as before
+python src/detect_logos.py --video videos/match.mp4 --detector yolo \
+    --weights runs/logo_yolo/weights/best.pt --conf 0.25 \
+    --output output/annotated.mp4 --report output/exposure.csv
+```
+
+Only `detect_fn` differs between backends; ByteTrack and the exposure report are
+shared, so everything in the [tracking + exposure](#tracking--exposure-report)
+section applies identically. Extra deps (`ultralytics`, `torch`) are in
+`requirements.txt`.
+
+**Honest caveats.** The synthetic logos are pasted opaque quads (the crop has no
+alpha), and the real logo in some background frames is left unlabelled — both add
+mild label noise. The model learns *this* logo's appearance well, but for
+production accuracy replace the synthetic set with hand-labelled frames (the
+training/inference code is unchanged). Multi-logo: add a crop per class and a
+`--logo`/class per `gen_synthetic.py` run, or label real data directly.
