@@ -196,6 +196,36 @@ def write_exposure_report(
               f"avg area {r['avg_screen_area_pct']:.2f}%")
 
 
+def transcode_h264(path: Path) -> None:
+    """Re-encode `path` in place to H.264/yuv420p + faststart so it plays in
+    browsers and mobile. supervision writes mp4v (MPEG-4 Part 2), which many
+    players can't decode. No-op (with a warning) if no ffmpeg is available.
+    """
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        try:  # imageio-ffmpeg ships a static binary (optional dependency)
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            print("  (skip H.264 re-encode: no ffmpeg; install imageio-ffmpeg "
+                  "for browser-playable output)")
+            return
+
+    tmp = path.with_suffix(".h264.mp4")
+    cmd = [ffmpeg, "-y", "-i", str(path), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+           "-movflags", "+faststart", "-preset", "veryfast", "-crf", "23", str(tmp)]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        tmp.replace(path)
+        print("  re-encoded to H.264 (browser/mobile playable)")
+    except Exception as e:  # leave the original mp4v file in place on failure
+        tmp.unlink(missing_ok=True)
+        print(f"  (H.264 re-encode failed, keeping mp4v: {e})")
+
+
 def process_video(args: argparse.Namespace) -> None:
     # Build a detector-agnostic `detect_fn(frame_bgr) -> sv.Detections` so the
     # tracking + exposure code below is shared by feature matching and YOLO.
@@ -310,6 +340,7 @@ def process_video(args: argparse.Namespace) -> None:
                 print(f"  ...{processed} frames processed, {hits} with detections")
 
     print(f"Done. Processed {processed} frames, {hits} contained a logo.")
+    transcode_h264(out_path)
     print(f"Annotated video written to: {out_path}")
 
     # Bridge gaps: a logo counts as on-screen for every processed frame between a
