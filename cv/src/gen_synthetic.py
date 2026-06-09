@@ -87,16 +87,22 @@ def warp_logo(logo: np.ndarray, target_w: int, rng: random.Random) -> tuple[np.n
 
 
 def paste(bg: np.ndarray, logo_w: np.ndarray, mask_w: np.ndarray, rng: random.Random):
-    """Paste warped logo at a random valid position; return YOLO bbox or None."""
+    """Alpha-blend warped logo at a random valid position; return YOLO bbox or None.
+
+    The mask edge is feathered so the composite has no hard rectangular border —
+    that artifact is what an earlier hard-paste version overfit to (great
+    synthetic mAP, near-zero real recall).
+    """
     H, W = bg.shape[:2]
     lh, lw = logo_w.shape[:2]
     if lw >= W or lh >= H:
         return None
     x = rng.randint(0, W - lw)
     y = rng.randint(0, H - lh)
-    roi = bg[y:y + lh, x:x + lw]
-    m3 = mask_w[..., None].astype(bool)
-    roi[:] = np.where(m3, logo_w, roi)
+    roi = bg[y:y + lh, x:x + lw].astype(np.float32)
+    alpha = cv2.GaussianBlur(mask_w.astype(np.float32), (5, 5), 0)[..., None] / 255.0
+    roi[:] = alpha * logo_w.astype(np.float32) + (1.0 - alpha) * roi
+    bg[y:y + lh, x:x + lw] = roi.astype(np.uint8)
 
     ys, xs = np.where(mask_w > 0)
     if len(xs) == 0:
