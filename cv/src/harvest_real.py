@@ -24,6 +24,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from detect_logos import build_detector, build_matcher, load_logos, detect_in_frame
 
 
+def detections_to_yolo_lines(det, width: int, height: int) -> list[str]:
+    """Convert sv.Detections boxes to normalised YOLO label lines."""
+    lines = []
+    for xyxy, cls in zip(det.xyxy, det.class_id):
+        x0, y0, x1, y1 = xyxy
+        cx = float(np.clip((x0 + x1) / 2 / width, 0, 1))
+        cy = float(np.clip((y0 + y1) / 2 / height, 0, 1))
+        bw = float(np.clip((x1 - x0) / width, 0, 1))
+        bh = float(np.clip((y1 - y0) / height, 0, 1))
+        lines.append(f"{int(cls)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+    return lines
+
+
+def iter_labeled_frames(video, templates, detector, matcher, stride=1,
+                        min_good=12, min_inliers=6):
+    """Yield (frame_index, frame_bgr, yolo_lines) for frames the SIFT teacher
+    detects the logo in. Frames with no detection are skipped (callers wanting
+    hard negatives sample those separately)."""
+    frames = sv.get_video_frames_generator(str(video), stride=stride)
+    for i, frame in enumerate(frames):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        det = detect_in_frame(gray, templates, detector, matcher, min_good, min_inliers)
+        if not len(det):
+            continue
+        H, W = frame.shape[:2]
+        yield i, frame, detections_to_yolo_lines(det, W, H)
+
+
 def harvest(args: argparse.Namespace) -> None:
     detector = build_detector("sift")
     matcher = build_matcher("sift")
@@ -39,23 +67,10 @@ def harvest(args: argparse.Namespace) -> None:
     info = sv.VideoInfo.from_video_path(args.video)
     print(f"Harvesting from {info.total_frames} frames at stride {args.stride}, "
           f"min_inliers={args.min_inliers} ...")
-    frames = sv.get_video_frames_generator(args.video, stride=args.stride)
     kept = 0
-    for i, frame in enumerate(frames):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        det = detect_in_frame(gray, templates, detector, matcher,
-                              args.min_good, args.min_inliers)
-        if not len(det):
-            continue
-        H, W = frame.shape[:2]
-        lines = []
-        for xyxy, cls in zip(det.xyxy, det.class_id):
-            x0, y0, x1, y1 = xyxy
-            cx = np.clip((x0 + x1) / 2 / W, 0, 1)
-            cy = np.clip((y0 + y1) / 2 / H, 0, 1)
-            bw = np.clip((x1 - x0) / W, 0, 1)
-            bh = np.clip((y1 - y0) / H, 0, 1)
-            lines.append(f"{int(cls)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+    for i, frame, lines in iter_labeled_frames(
+            args.video, templates, detector, matcher,
+            args.stride, args.min_good, args.min_inliers):
         split = "val" if kept % args.val_every == 0 else "train"
         stem = f"real_{i:05d}"
         cv2.imwrite(str(root / "images" / split / f"{stem}.jpg"), frame)

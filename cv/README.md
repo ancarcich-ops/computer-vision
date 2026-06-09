@@ -32,8 +32,10 @@ cv/
 ├── runs/               # YOLO training outputs / weights (generated)
 └── src/
     ├── detect_logos.py  # main pipeline (orb / sift / yolo backends)
+    ├── build_dataset.py # combine many clips + negatives into one YOLO dataset
+    ├── harvest_real.py  # SIFT teacher auto-labels real frames (one clip)
     ├── gen_synthetic.py # build a YOLO dataset from one logo crop
-    ├── train_yolo.py    # train YOLOv8 on the synthetic dataset
+    ├── train_yolo.py    # train YOLOv8 on the dataset
     └── make_demo.py     # synthetic demo generator (verification)
 ```
 
@@ -109,32 +111,61 @@ detections across long gaps. The fix is the trained YOLO backend below.
 ## YOLO route (best recall)
 
 A trained detector generalises to scale, rotation, and partial occlusion far
-better than feature matching — but normally needs a hand-labelled dataset we
-don't have. We bootstrap one from the **single logo crop**: paste it onto real
-clip frames under random augmentation and auto-generate YOLO labels.
+better than feature matching — but normally needs a hand-labelled dataset. We
+avoid manual labelling with **weak supervision**: the SIFT detector acts as a
+*teacher* that auto-labels real frames, and YOLO is the *student* trained on
+them. The student learns the logo's real appearance and generalises past the
+teacher's recall.
+
+> ⚠️ **The #1 lesson: train on MANY clips, not one.** A model trained on a
+> single clip learns the *scene* (e.g. "centred person's torso = logo"), not the
+> logo — it scored great in-domain but fired on ~60% of an unseen clip's frames
+> where no logo existed. Diverse sources + hard negatives are what make it
+> generalise. Use `build_dataset.py` below, not the single-clip path.
+
+### Recommended: multi-clip dataset
 
 ```bash
-# 1. Synthesize a labelled dataset from one crop + the clip (backgrounds)
-python src/gen_synthetic.py --video videos/match.mp4 --logo logos/lenovo.png \
-    --out dataset --train 240 --val 50
+# clips/      -> several clips that CONTAIN the logo (different games/angles)
+# negatives/  -> logo-FREE clips, ideally with people/jerseys (suppress
+#                torso/background false positives). Optional but important.
 
-# 2. Fine-tune YOLOv8n on CPU (base weights auto-download once)
-python src/train_yolo.py --data dataset/data.yaml --epochs 30 --imgsz 416
+# 1. Build one combined dataset: SIFT auto-labels positives, negatives become
+#    empty-label backgrounds. Hold a whole clip out for honest evaluation.
+python src/build_dataset.py --clips clips/ --negatives negatives/ \
+    --out dataset --val-clips held_out_game --fresh
 
-# 3. Detect with the trained model — same tracking + exposure CSV as before
-python src/detect_logos.py --video videos/match.mp4 --detector yolo \
-    --weights runs/logo_yolo/weights/best.pt --conf 0.25 \
+# 2. Train (base weights auto-download once)
+python src/train_yolo.py --data dataset/data.yaml --epochs 40 --imgsz 512 \
+    --name logo_real
+
+# 3. Test on a clip that was NOT in training — the real generalisation check
+python src/detect_logos.py --video videos/unseen.mp4 --detector yolo \
+    --weights runs/logo_real/weights/best.pt --conf 0.25 \
     --output output/annotated.mp4 --report output/exposure.csv
 ```
 
-Only `detect_fn` differs between backends; ByteTrack and the exposure report are
-shared, so everything in the [tracking + exposure](#tracking--exposure-report)
+`build_dataset.py` flags: `--stride` (positive sampling), `--neg-stride`
+(negative sampling), `--min-inliers` (teacher precision gate), `--synthetic N`
+(add pasted-logo composites for variety), `--val-clips` (hold whole clips out of
+training). Multi-logo works out of the box: drop one crop per logo in `logos/`
+(filename = class name) — every script reads all of them.
+
+Only `detect_fn` differs between the orb/sift/yolo backends; ByteTrack and the
+exposure report are shared, so the [tracking + exposure](#tracking--exposure-report)
 section applies identically. Extra deps (`ultralytics`, `torch`) are in
 `requirements.txt`.
 
-**Honest caveats.** The synthetic logos are pasted opaque quads (the crop has no
-alpha), and the real logo in some background frames is left unlabelled — both add
-mild label noise. The model learns *this* logo's appearance well, but for
-production accuracy replace the synthetic set with hand-labelled frames (the
-training/inference code is unchanged). Multi-logo: add a crop per class and a
-`--logo`/class per `gen_synthetic.py` run, or label real data directly.
+### Single-clip helpers (bootstrapping / quick tests)
+
+`gen_synthetic.py` (paste one crop onto frames) and `harvest_real.py` (SIFT
+auto-label one clip) are the building blocks `build_dataset.py` wraps. Useful in
+isolation, but **synthetic-only doesn't transfer** (0.99 synth mAP, ~0 real
+recall — it overfits the paste artifacts) and **single-clip training memorises
+the scene**. Always prefer the multi-clip path for anything real.
+
+### Why confidence matters
+
+`--conf` is the precision/recall dial. Lower it (e.g. `0.10`) for more recall,
+raise it to cut false positives. Tune it against a held-out clip, not the
+training clips.
